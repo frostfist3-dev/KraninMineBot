@@ -3,9 +3,12 @@ import os
 import re
 import secrets
 import time
-from typing import Dict, Set
+from collections import defaultdict, deque
+from typing import Deque, Dict, Set
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -13,20 +16,41 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 BOT_USERNAME = os.environ["BOT_USERNAME"].lstrip("@")
 PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+DEFAULT_MODEL = "openai/gpt-oss-20b"
 
-app = FastAPI(title="Kranin Mine Telegram Bridge")
+app = FastAPI(title="Kranin Mine Telegram + AI Bridge")
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
-# Starter storage only. Restart/redeploy clears these maps; use PostgreSQL
-# before relying on notifications long-term.
+# Starter storage: deploy/restart clears notification links and in-memory rate counters.
 code_to_chats: Dict[str, Set[int]] = {}
 pending_codes: Dict[str, float] = {}
 last_heartbeat: Dict[str, float] = {}
 running_state: Dict[str, bool] = {}
 crash_notified: Set[str] = set()
+ai_by_client: Dict[str, Deque[float]] = defaultdict(deque)
+ai_by_ip: Dict[str, Deque[float]] = defaultdict(deque)
 
 LINK_CODE_TTL = 60 * 60 * 24 * 30
 HEARTBEAT_TIMEOUT = 90
+AI_CLIENT_LIMIT = 15       # requests per 60 seconds per installation
+AI_IP_LIMIT = 120          # requests per 60 minutes per IP
+
+
+def re_safe_code(code: str) -> bool:
+    return 16 <= len(code) <= 128 and all(ch in "0123456789abcdefABCDEF" for ch in code)
+
+
+def within_limit(bucket: Dict[str, Deque[float]], key: str, limit: int, period: int) -> bool:
+    now = time.time()
+    hits = bucket[key]
+    while hits and now - hits[0] >= period:
+        hits.popleft()
+    if len(hits) >= limit:
+        return False
+    hits.append(now)
+    return True
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -34,8 +58,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     code = context.args[0] if context.args else ""
     if code and re_safe_code(code):
-        # The install code is a bearer secret. Only people who possess it can
-        # bind their Telegram chat to that installation.
         chats = code_to_chats.setdefault(code, set())
         chats.add(update.effective_chat.id)
         pending_codes[code] = time.time() + LINK_CODE_TTL
@@ -45,13 +67,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(
-            "Привет! Открой Lua-скрипт → раздел «О авторе» → «Подключить уведомления Telegram», "
+            "Привет! Открой Lua-скрипт → раздел «Об авторе» → «Подключить уведомления Telegram», "
             "затем вернись сюда и нажми Start."
         )
-
-
-def re_safe_code(code: str) -> bool:
-    return 16 <= len(code) <= 128 and all(ch in "0123456789abcdefABCDEF" for ch in code)
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -106,8 +124,7 @@ async def shutdown():
 
 
 async def crash_watchdog():
-    # Best-effort detector: heartbeat loss can mean a crash, network loss,
-    # game exit, or Render sleeping. It cannot prove the game crashed.
+    # Heartbeat loss can mean a crash, network loss, game exit, or Render sleeping.
     while True:
         await asyncio.sleep(15)
         now = time.time()
@@ -127,13 +144,23 @@ async def notify_code(code: str, text: str):
         try:
             await tg_app.bot.send_message(chat_id=chat_id, text=text)
         except Exception:
-            # Continue delivering to other linked chats if one has blocked the bot.
             pass
 
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "kranin-mine-telegram-bridge"}
+    return {
+        "ok": True,
+        "service": "kranin-mine-bridge",
+        "ai_proxy_configured": bool(GROQ_API_KEY),
+    }
+
+
+@app.get("/telegram/link")
+async def telegram_link(code: str):
+    if not re_safe_code(code):
+        raise HTTPException(status_code=400, detail="Invalid pairing code")
+    return RedirectResponse(url=f"https://t.me/{BOT_USERNAME}?start={code}", status_code=302)
 
 
 @app.post("/telegram/webhook")
@@ -150,17 +177,9 @@ async def telegram_webhook(
 
 
 @app.get("/telegram/event")
-async def telegram_event(
-    code: str,
-    event: str,
-    running: str = "0",
-    info: str = ""
-):
+async def telegram_event(code: str, event: str, running: str = "0", info: str = ""):
     if not re_safe_code(code):
         raise HTTPException(status_code=400, detail="Invalid pairing code")
-
-    # Any caller must know the installation's high-entropy pairing code.
-    # Never reuse a code across installations; keep config/mbot.ini private.
     event_key = event.strip().lower()
     running_now = running == "1"
     info = info[:500].strip()
@@ -180,6 +199,7 @@ async def telegram_event(
         "license_error": "🔑 ПРОБЛЕМА С ЛИЦЕНЗИЕЙ",
         "status": "📊 СТАТУС",
         "crash": "🔴 ВОЗМОЖНЫЙ ВЫЛЕТ / ПОТЕРЯ СВЯЗИ",
+        "target_reached": "✅ ЦЕЛЬ ДОСТИГНУТА",
     }
     if event_key not in labels:
         raise HTTPException(status_code=400, detail="Unsupported event")
@@ -191,8 +211,87 @@ async def telegram_event(
     if event_key in ("stop", "script_unloaded"):
         crash_notified.discard(code)
 
-    text = labels[event_key]
+    message = labels[event_key]
     if info:
-        text += "\n" + info
-    await notify_code(code, text)
+        message += "\n" + info
+    await notify_code(code, message)
     return {"ok": True, "event": event_key, "linked_chats": len(code_to_chats.get(code, set()))}
+
+
+@app.post("/api/ai/chat")
+async def ai_chat(request: Request, x_client_id: str = Header(default="")):
+    """OpenAI-compatible proxy. Groq key stays on the server, not in client Lua."""
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=503, detail="Server AI key is not configured")
+    client_id = x_client_id.strip()
+    if not re_safe_code(client_id):
+        raise HTTPException(status_code=401, detail="Invalid client installation ID")
+
+    ip = request.client.host if request.client else "unknown"
+    if not within_limit(ai_by_client, client_id, AI_CLIENT_LIMIT, 60):
+        raise HTTPException(status_code=429, detail="Client AI rate limit exceeded")
+    if not within_limit(ai_by_ip, ip, AI_IP_LIMIT, 3600):
+        raise HTTPException(status_code=429, detail="Network AI rate limit exceeded")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON object required")
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages or len(messages) > 20:
+        raise HTTPException(status_code=400, detail="messages must contain 1-20 items")
+    clean_messages = []
+    total_chars = 0
+    for item in messages:
+        if not isinstance(item, dict) or item.get("role") not in ("system", "user", "assistant"):
+            raise HTTPException(status_code=400, detail="Invalid message")
+        content = item.get("content")
+        if not isinstance(content, str):
+            raise HTTPException(status_code=400, detail="Message content must be text")
+        total_chars += len(content)
+        if total_chars > 12000:
+            raise HTTPException(status_code=413, detail="Messages too large")
+        clean_messages.append({"role": item["role"], "content": content})
+
+    model = body.get("model", DEFAULT_MODEL)
+    if not isinstance(model, str) or not model or len(model) > 100:
+        model = DEFAULT_MODEL
+    try:
+        max_tokens = int(body.get("max_tokens", 60))
+    except (TypeError, ValueError):
+        max_tokens = 60
+    max_tokens = max(1, min(max_tokens, 120))
+    try:
+        temperature = float(body.get("temperature", 0.7))
+    except (TypeError, ValueError):
+        temperature = 0.7
+    temperature = max(0.0, min(temperature, 1.5))
+
+    payload = {
+        "model": model,
+        "messages": clean_messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                GROQ_ENDPOINT,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json=payload,
+            )
+        try:
+            content = response.json()
+        except Exception:
+            content = {"error": {"message": response.text[:1000]}}
+        return JSONResponse(status_code=response.status_code, content=content)
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Groq request timed out")
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="Could not reach Groq API")
