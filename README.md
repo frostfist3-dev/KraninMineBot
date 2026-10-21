@@ -1,28 +1,22 @@
-# Telegram Script Notifier — starter
+# Kranin Mine Telegram Bridge (compatible with current Lua GET requests)
 
-This is a starter service for testing a Telegram bot plus HTTPS API on Render.
+## Render environment variables
+- `BOT_TOKEN`: BotFather token (server-side only)
+- `BOT_USERNAME`: bot username without `@`
+- `WEBHOOK_SECRET`: long random secret
+- `PUBLIC_URL`: `https://kraninminebot.onrender.com`
 
-## Files
-- `app.py` — Telegram webhook and API endpoints.
-- `requirements.txt` — Python dependencies.
+## Render commands
+Build: `pip install -r requirements.txt`
+Start: `uvicorn app:app --host 0.0.0.0 --port $PORT`
 
-## Render settings
-Create a **Web Service** connected to this GitHub repository:
-- Runtime: Python
-- Build command: `pip install -r requirements.txt`
-- Start command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-- Health check path: `/`
+## Lua config
+In `moonloader/config/mbot.ini`:
+- `telegram.enabled = true` is set when the user presses the connect button
+- `telegram.bot_username = YOUR_BOT_USERNAME` must be changed to the actual bot username
+- `telegram.bridge_url = https://kraninminebot.onrender.com/telegram/event`
 
-Set these environment variables in Render:
-- `BOT_TOKEN` — token from BotFather (secret; do not share it)
-- `BOT_USERNAME` — bot username without `@`
-- `BRIDGE_SECRET` — a long random secret, used by the Lua/server bridge
-- `WEBHOOK_SECRET` — a different long random secret
-- `PUBLIC_URL` — service URL, e.g. `https://your-service.onrender.com`
+Then restart the script, open the Telegram connection button, and press Start in the bot.
 
-After first deploy, check the Render logs and open the service URL. It should return JSON with `"ok": true`.
-
-## Important limitations of this starter
-This version keeps pending link codes and subscribers in RAM. They are lost when the service restarts or redeploys. Use a persistent database such as PostgreSQL before real multi-user use.
-It does not yet connect to a Lua script automatically. The script must request a one-time link code from `/api/link` and send events to `/api/event`, with `X-Bridge-Secret` header. Never put `BOT_TOKEN` in the Lua script.
-The `/api/link` endpoint expects a random one-time code to be created by a trusted bridge/server; do not expose a shared bridge secret inside a public Lua script. For production, use a per-user signed pairing flow and persistent database.
+## Limitations / security
+This is a starter implementation. Pairing codes are per-install bearer secrets, so users must keep `config/mbot.ini` private and never share a pairing code. The current server stores bindings in RAM and loses them on restart/redeploy; add PostgreSQL before relying on it. Heartbeat loss is only a possible crash/network loss, not proof of a crash. This implementation does not send admin-threat alerts.
