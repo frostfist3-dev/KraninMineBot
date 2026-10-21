@@ -29,6 +29,7 @@ pending_codes: Dict[str, float] = {}
 last_heartbeat: Dict[str, float] = {}
 running_state: Dict[str, bool] = {}
 crash_notified: Set[str] = set()
+watchdog_task = None
 ai_by_client: Dict[str, Deque[float]] = defaultdict(deque)
 ai_by_ip: Dict[str, Deque[float]] = defaultdict(deque)
 
@@ -106,19 +107,31 @@ tg_app.add_handler(CommandHandler("status", status_cmd))
 
 @app.on_event("startup")
 async def startup():
+    global watchdog_task
     await tg_app.initialize()
     await tg_app.start()
+    # Register the live webhook whenever a Render process starts.
     await tg_app.bot.set_webhook(
         url=f"{PUBLIC_URL}/telegram/webhook",
         secret_token=WEBHOOK_SECRET,
         allowed_updates=["message"],
     )
-    asyncio.create_task(crash_watchdog())
+    watchdog_task = asyncio.create_task(crash_watchdog())
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    await tg_app.bot.delete_webhook()
+    global watchdog_task
+    # Do not delete the webhook during process shutdown. On a rolling restart,
+    # an old instance can shut down after the replacement registers the webhook
+    # and erase the new registration, leaving Telegram commands unanswered.
+    if watchdog_task is not None:
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+        watchdog_task = None
     await tg_app.stop()
     await tg_app.shutdown()
 
