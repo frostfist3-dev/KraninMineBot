@@ -3,8 +3,7 @@ import os
 import re
 import secrets
 import time
-from collections import defaultdict, deque
-from typing import Deque, Dict, Set
+from typing import Dict, Set
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -23,35 +22,18 @@ DEFAULT_MODEL = "openai/gpt-oss-20b"
 app = FastAPI(title="Kranin Mine Telegram + AI Bridge")
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
-# Starter storage: deploy/restart clears notification links and in-memory rate counters.
+# Starter storage: notification links and event state are kept in memory and reset on restart.
 code_to_chats: Dict[str, Set[int]] = {}
 pending_codes: Dict[str, float] = {}
 last_heartbeat: Dict[str, float] = {}
 running_state: Dict[str, bool] = {}
 crash_notified: Set[str] = set()
 watchdog_task = None
-ai_by_client: Dict[str, Deque[float]] = defaultdict(deque)
-ai_by_ip: Dict[str, Deque[float]] = defaultdict(deque)
-
 LINK_CODE_TTL = 60 * 60 * 24 * 30
 HEARTBEAT_TIMEOUT = 90
-AI_CLIENT_LIMIT = 15       # requests per 60 seconds per installation
-AI_IP_LIMIT = 120          # requests per 60 minutes per IP
-
 
 def re_safe_code(code: str) -> bool:
     return 16 <= len(code) <= 128 and all(ch in "0123456789abcdefABCDEF" for ch in code)
-
-
-def within_limit(bucket: Dict[str, Deque[float]], key: str, limit: int, period: int) -> bool:
-    now = time.time()
-    hits = bucket[key]
-    while hits and now - hits[0] >= period:
-        hits.popleft()
-    if len(hits) >= limit:
-        return False
-    hits.append(now)
-    return True
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -213,6 +195,7 @@ async def telegram_event(code: str, event: str, running: str = "0", info: str = 
         "status": "📊 СТАТУС",
         "crash": "🔴 ВОЗМОЖНЫЙ ВЫЛЕТ / ПОТЕРЯ СВЯЗИ",
         "target_reached": "✅ ЦЕЛЬ ДОСТИГНУТА",
+        "admin_attention": "⚠️ ВОЗМОЖНОЕ ОБРАЩЕНИЕ / ПРОВЕРКА В ЧАТЕ",
     }
     if event_key not in labels:
         raise HTTPException(status_code=400, detail="Unsupported event")
@@ -239,12 +222,6 @@ async def ai_chat(request: Request, x_client_id: str = Header(default="")):
     client_id = x_client_id.strip()
     if not re_safe_code(client_id):
         raise HTTPException(status_code=401, detail="Invalid client installation ID")
-
-    ip = request.client.host if request.client else "unknown"
-    if not within_limit(ai_by_client, client_id, AI_CLIENT_LIMIT, 60):
-        raise HTTPException(status_code=429, detail="Client AI rate limit exceeded")
-    if not within_limit(ai_by_ip, ip, AI_IP_LIMIT, 3600):
-        raise HTTPException(status_code=429, detail="Network AI rate limit exceeded")
 
     try:
         body = await request.json()
