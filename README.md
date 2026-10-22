@@ -1,24 +1,52 @@
-# KraninMine Telegram + Groq AI server
+# Kranin Mine — Telegram + AI hardening update
 
-## Render environment
-Keep these existing variables:
-- `BOT_TOKEN` — Telegram bot token
-- `BOT_USERNAME` — bot username without `@`
-- `WEBHOOK_SECRET` — Telegram webhook secret
-- `PUBLIC_URL` — `https://kraninminebot.onrender.com`
-- `GROQ_API_KEY` — Groq API key stored only in Render environment variables
+## Что исправлено
 
-## Deploy
-Replace `app.py` and `requirements.txt` in the existing Render service, then deploy.
-Start command:
-`uvicorn app:app --host 0.0.0.0 --port $PORT`
+- UTF-8 для уведомлений Lua-клиента с сохранением уже корректных UTF-8-строк и эмодзи; сервер также пытается исправлять старые сообщения CP1251.
+- События, очередь команд и отчёты о командах теперь передаются новым клиентом через POST, чтобы link code не попадал в query string URL. Сервер пока сохраняет совместимость со старыми GET-клиентами.
+- Запросы AI доступны только установкам, привязанным к Telegram-чату; добавлены ограничения частоты по установке и суточные ограничения по IP.
+- Квитанция команды не удаляется до проверки кода и успешной доставки результата в Telegram.
+- `WEBHOOK_SECRET`, `BOT_TOKEN`, `BOT_USERNAME` и `PUBLIC_URL` проверяются при старте; webhook регистрируется с повторами.
+- `/closegame` требует подтверждения inline-кнопкой и принимает подтверждение только от пользователя, который вызвал команду.
+- Добавлены предупреждение об офлайне, дедупликация команд, ограничение очереди, восстановление связи и подавление повторного STOP после достижения цели.
+- JSON-снимок состояния сохраняется атомарно; для сохранения между перезапусками нужен постоянный диск или база данных.
+- Указан один Uvicorn worker, чтобы несколько процессов не разошлись по независимым in-memory очередям.
+- Исправлены satiety-dialog guard, лишний скан коллизий каждый кадр, стартовая строка и некоторые потенциально опасные вызовы SA-MP.
 
-The root endpoint reports `ai_proxy_configured: true` when `GROQ_API_KEY` is configured. `/api/ai/chat` accepts OpenAI-compatible chat-completion requests. The app no longer applies its own per-installation or per-IP request-count quotas. Groq's own account, model, concurrency and rate limits still apply, and timeouts/input validation remain enabled.
+## Обновление сервера на Render
 
-**Security note:** with application-level quotas removed, anyone who discovers the public proxy URL and can construct a valid hexadecimal client ID may attempt to use the shared Groq key. Monitor Groq usage and rotate the key if abuse is suspected. Do not put `GROQ_API_KEY` into Lua files.
+1. Сделайте резервную копию текущего `app.py`.
+2. Замените `app.py` содержимым папки `server/` и добавьте `requirements.txt` и `Procfile`.
+3. В Render задайте Environment Variables:
+   - `BOT_TOKEN` — токен Telegram-бота.
+   - `BOT_USERNAME` — username бота без символа `@`.
+   - `PUBLIC_URL` — публичный HTTPS URL сервиса, например `https://kraninminebot.onrender.com`.
+   - `WEBHOOK_SECRET` — случайная непустая строка из букв, цифр, `_` или `-`.
+   - `GROQ_API_KEY` — серверный ключ Groq, если нужна ИИ-функция.
+   - Необязательно: `AI_MIN_INTERVAL_SECONDS=2.5`, `AI_DAILY_IP_LIMIT=300`.
+4. Команда запуска: `uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1`.
+5. После деплоя проверьте `/health`. Он вернёт 200, когда Telegram и webhook подняты; до этого вернёт 503. `/` показывает диагностические поля.
 
-## Lua file
-Use `KRANINmineV4_ADMIN_ALERT_NO_AI_CAP.lua`. The default AI endpoint is `https://kraninminebot.onrender.com/api/ai/chat`; the shared Groq key remains on Render.
+**Важно про сохранение состояния:** приложение по умолчанию пишет `./kranin_state.json`, но на временной файловой системе Render Free данные могут пропасть при перезапуске/деплое. Для устойчивого хранения настройте поддерживаемую постоянную БД или постоянный диск на тарифе, где он доступен, и укажите, например, `STATE_FILE=/var/data/kranin_state.json`. Не выставляйте несколько Uvicorn workers, пока состояние хранится локально в памяти.
 
-## Administrator message detection
-Lines beginning with the explicit `Администратор`, `Administrator`, `Admin:` and supported `[A]`/`[Адм]` prefixes bypass Groq's yes/no classifier. This keeps the previous heuristic active for system notices like transport spawning, forum applications, and TSP release/jail messages. Explicit administrator-prefixed lines trigger immediately; ambiguous text-only matches are throttled to one Telegram alert every 45 seconds. The original protection/auto-reply branch keeps its own existing safety checks. This is text-pattern recognition, not cryptographic verification of a player's role.
+## Обновление Lua на Android
+
+1. Скопируйте текущий `KRANINmineV5.lua` в резервную папку.
+2. Скопируйте `client/KRANINmineV5.lua` в папку MonetLoader и переименуйте как `KRANINmineV5.lua`.
+3. Запустите игру, проверьте меню, `/status` и `/stats` в Telegram, а затем уже остальные команды.
+
+## Команды Telegram
+
+- `/status` — состояние скрипта/лицензии.
+- `/stats` — статистика.
+- `/stopbot` — остановить автоматизацию в игре.
+- `/startbot` — запустить автоматизацию, если лицензия активна.
+- `/closegame` — запросить закрытие игры; обязательно подтвердить inline-кнопкой.
+- `/stop` — отключить привязку для этого чата.
+- `/help` — справка.
+
+## Что не удалось проверить автоматически
+
+- Lua-синтаксис и выполнение на реальном Android/MonetLoader: в среде сборки нет LuaJIT/MonetLoader.
+- Реальный вызов Telegram Bot API и Groq: внешние секреты и работающий Render-инстанс недоступны из проверки.
+- На клиенте `os.exit(0)` оставлен как команда закрытия процесса, но её фактическое поведение в вашем Android-билде необходимо проверить на устройстве. Если она выгружает лишь Lua-скрипт, замените закрытие на совместимый для вашей сборки API.
