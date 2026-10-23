@@ -824,41 +824,59 @@ async def ai_chat(request: Request, x_client_id: str = Header(default="")):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="JSON object required")
-    messages = body.get("messages")
-    if not isinstance(messages, list) or not messages or len(messages) > 20:
-        raise HTTPException(status_code=400, detail="messages must contain 1-20 items")
-    clean_messages = []
-    total_chars = 0
-    for item in messages:
-        if not isinstance(item, dict) or item.get("role") not in ("system", "user", "assistant"):
-            raise HTTPException(status_code=400, detail="Invalid message")
-        content = item.get("content")
-        if not isinstance(content, str):
-            raise HTTPException(status_code=400, detail="Message content must be text")
-        total_chars += len(content)
-        if total_chars > 12000:
-            raise HTTPException(status_code=413, detail="Messages too large")
-        clean_messages.append({"role": item["role"], "content": content})
+    # The UI's connectivity check is deliberately isolated from normal AI chat:
+    # use a fixed tiny prompt and a larger completion budget so GPT-OSS reasoning
+    # does not consume the entire 60-token default before producing visible text.
+    purpose = body.get("purpose", "chat")
+    if purpose not in ("chat", "test"):
+        raise HTTPException(status_code=400, detail="Unsupported AI request purpose")
 
     requested_model = body.get("model", DEFAULT_MODEL)
     model = requested_model if isinstance(requested_model, str) and requested_model in ALLOWED_MODELS else DEFAULT_MODEL
-    try:
-        max_tokens = int(body.get("max_tokens", 60))
-    except (TypeError, ValueError):
-        max_tokens = 60
-    max_tokens = max(1, min(max_tokens, 120))
-    try:
-        temperature = float(body.get("temperature", 0.7))
-    except (TypeError, ValueError):
-        temperature = 0.7
-    temperature = max(0.0, min(temperature, 1.5))
 
-    payload = {
-        "model": model,
-        "messages": clean_messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
+    if purpose == "test":
+        clean_messages = [{"role": "user", "content": "Reply with exactly the word OK."}]
+        payload = {
+            "model": model,
+            "messages": clean_messages,
+            "temperature": 0,
+            "max_completion_tokens": 256,
+            "reasoning_effort": "low",
+            "reasoning_format": "hidden",
+        }
+    else:
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages or len(messages) > 20:
+            raise HTTPException(status_code=400, detail="messages must contain 1-20 items")
+        clean_messages = []
+        total_chars = 0
+        for item in messages:
+            if not isinstance(item, dict) or item.get("role") not in ("system", "user", "assistant"):
+                raise HTTPException(status_code=400, detail="Invalid message")
+            content = item.get("content")
+            if not isinstance(content, str):
+                raise HTTPException(status_code=400, detail="Message content must be text")
+            total_chars += len(content)
+            if total_chars > 12000:
+                raise HTTPException(status_code=413, detail="Messages too large")
+            clean_messages.append({"role": item["role"], "content": content})
+
+        try:
+            max_tokens = int(body.get("max_tokens", 60))
+        except (TypeError, ValueError):
+            max_tokens = 60
+        max_tokens = max(1, min(max_tokens, 120))
+        try:
+            temperature = float(body.get("temperature", 0.7))
+        except (TypeError, ValueError):
+            temperature = 0.7
+        temperature = max(0.0, min(temperature, 1.5))
+        payload = {
+            "model": model,
+            "messages": clean_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
     # Count only requests that pass validation and are actually sent upstream.
     ai_last_request[client_id] = now
     ai_ip_daily[day_key] = ai_ip_daily.get(day_key, 0) + 1
