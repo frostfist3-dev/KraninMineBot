@@ -54,6 +54,7 @@ crash_notified: Set[str] = set()
 command_queues: Dict[str, list] = {}
 command_receipts: Dict[str, dict] = {}
 recent_commands: Dict[tuple, float] = {}
+admin_action_tokens: Dict[str, dict] = {}
 ai_last_request: Dict[str, float] = {}
 ai_ip_daily: Dict[tuple, int] = {}
 watchdog_task = None
@@ -189,6 +190,10 @@ def _clean_state(now: float | None = None) -> None:
         if now - stamp > 10:
             recent_commands.pop(key, None)
             changed = True
+    for token, action in list(admin_action_tokens.items()):
+        if action.get("expires_at", 0) < now:
+            admin_action_tokens.pop(token, None)
+            changed = True
     # A pairing code expires after 30 days without being re-linked.
     for code, expires_at in list(pending_codes.items()):
         if expires_at < now:
@@ -295,6 +300,34 @@ async def queue_command_for_chat(chat_id: int, command: str) -> dict:
         "duplicate": duplicate,
         "offline": offline,
     }
+
+
+async def queue_command_for_install(code: str, chat_id: int, command: str) -> dict:
+    if command not in ALLOWED_COMMANDS:
+        return {"linked": False, "added": 0, "duplicate": 0, "offline": 0}
+    if chat_id not in code_to_chats.get(code, set()):
+        return {"linked": False, "added": 0, "duplicate": 0, "offline": 0}
+    now = time.time()
+    _clean_state(now)
+    dedupe_key = (code, chat_id, command)
+    previous = recent_commands.get(dedupe_key, 0)
+    if now - previous < 10:
+        return {"linked": True, "added": 0, "duplicate": 1, "offline": 0}
+    queue = command_queues.setdefault(code, [])
+    if len(queue) >= MAX_QUEUE_PER_INSTALL:
+        return {"linked": True, "added": 0, "duplicate": 0, "offline": 0}
+    command_id = secrets.token_hex(8)
+    queue.append({"id": command_id, "command": command, "chat_id": chat_id, "created_at": now})
+    command_receipts[command_id] = {
+        "code": code,
+        "chat_id": chat_id,
+        "created_at": now,
+        "expires_at": now + QUEUE_TTL,
+    }
+    recent_commands[dedupe_key] = now
+    _save_state()
+    last_seen = last_heartbeat.get(code, 0)
+    return {"linked": True, "added": 1, "duplicate": 0, "offline": (not last_seen or now - last_seen > 60)}
 
 
 async def enqueue_from_chat(update: Update, command: str):
@@ -429,6 +462,51 @@ async def closegame_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(message)
 
 
+async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.message or not query.from_user:
+        return
+    try:
+        action, token = (query.data or "").split(":", 1)
+    except ValueError:
+        await query.answer("Кнопка недействительна.", show_alert=True)
+        return
+    record = admin_action_tokens.get(token)
+    if not record or record.get("expires_at", 0) < time.time():
+        admin_action_tokens.pop(token, None)
+        await query.answer("Кнопка устарела. Используй /status или /help.", show_alert=True)
+        return
+    chat_id = query.message.chat_id
+    if record.get("chat_id") != chat_id or chat_id not in code_to_chats.get(record.get("code", ""), set()):
+        await query.answer("Эта кнопка не привязана к этому чату.", show_alert=True)
+        return
+    if action == "admin_resume":
+        command = "startbot"
+        status_text = "⌛ Запрос на продолжение работы поставлен в очередь."
+    elif action == "admin_quit":
+        command = "close_game"
+        status_text = "⌛ Подтверждённый запрос на выход из игры поставлен в очередь."
+    else:
+        await query.answer("Неизвестное действие.", show_alert=True)
+        return
+
+    result = await queue_command_for_install(record["code"], chat_id, command)
+    if not result["linked"]:
+        await query.answer("Установка больше не привязана к чату.", show_alert=True)
+        return
+    if not result["added"]:
+        await query.answer("Команда уже отправлена недавно или очередь заполнена.", show_alert=True)
+        return
+    admin_action_tokens.pop(token, None)
+    await query.answer("Команда отправлена")
+    if result.get("offline"):
+        status_text += "\n⚠️ Скрипт офлайн; команда истечёт через 10 минут, если связь не восстановится."
+    try:
+        await query.edit_message_text((query.message.text or "⚠️ Обращение администратора") + "\n\n" + status_text)
+    except Exception:
+        logger.exception("Could not update admin-action message")
+
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or not update.message:
         return
@@ -453,6 +531,7 @@ tg_app.add_handler(CommandHandler("stopbot", stopbot_cmd))
 tg_app.add_handler(CommandHandler("startbot", startbot_cmd))
 tg_app.add_handler(CommandHandler("closegame", closegame_cmd))
 tg_app.add_handler(CallbackQueryHandler(closegame_callback, pattern=r"^close_(yes|no):\d+$"))
+tg_app.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admin_(resume|quit):[0-9a-f]{12}$"))
 
 
 async def _webhook_registration_loop() -> None:
@@ -530,6 +609,32 @@ async def notify_code(code: str, message: str):
             await tg_app.bot.send_message(chat_id=chat_id, text=message)
         except Exception:
             logger.exception("Could not send Telegram notification for code %s", code[:6])
+
+
+async def notify_admin_attention(code: str, message: str):
+    now = time.time()
+    for token, action in list(admin_action_tokens.items()):
+        if action.get("expires_at", 0) < now:
+            admin_action_tokens.pop(token, None)
+    for chat_id in list(code_to_chats.get(code, set())):
+        token = secrets.token_hex(6)
+        admin_action_tokens[token] = {
+            "code": code,
+            "chat_id": chat_id,
+            "expires_at": now + 600,
+        }
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ Продолжить работу", callback_data=f"admin_resume:{token}"),
+            InlineKeyboardButton("⛔ Выйти с игры", callback_data=f"admin_quit:{token}"),
+        ]])
+        try:
+            await tg_app.bot.send_message(
+                chat_id=chat_id,
+                text=message + "\n\nВыбери действие. Кнопки активны 10 минут.",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            logger.exception("Could not send admin alert for code %s", code[:6])
 
 
 @app.get("/")
@@ -629,7 +734,10 @@ async def telegram_event(request: Request):
     message = labels[event_key]
     if info:
         message += "\n" + info
-    await notify_code(code, message)
+    if event_key == "admin_attention":
+        await notify_admin_attention(code, message)
+    else:
+        await notify_code(code, message)
     _save_state()
     return {"ok": True, "event": event_key, "linked_chats": len(code_to_chats.get(code, set()))}
 
